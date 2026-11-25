@@ -35,18 +35,20 @@ param(
     # Experimental: also move title windows to card memory and cut pipeline
     # waits. Needs a restart to apply; use run-extreme.ps1.
     [switch]$Extreme,
+    # Speed switches without the aggressive texture staging (the 42 ms heap pass).
+    [switch]$Fast,
     # Alternate binary (e.g. the diagnostics build that honours the loop limit).
     [string]$VictoryBinary = ""
 )
 
-if ($Extreme) { $Turbo = $true }
+if ($Extreme -or $Fast) { $Turbo = $true }
 
 # The fork otherwise reports a 3840x2160 TV to the title, which makes it
 # allocate 4x the render-target bytes and do 4x the pixel work. -Turbo uses
 # 720p because pixel work is the largest remaining cost on this card.
 $DisplayMode = if ($Extreme) { "960x540" } elseif ($Turbo) { "1280x720" } else { $Resolution }
-$TextureStageMs = if ($Extreme) { 500 } elseif ($Turbo) { 400 } else { 250 }
-$EarlyTexturesMs = if ($Extreme) { 250 } elseif ($Turbo) { 200 } else { 50 }
+$TextureStageMs = if ($Extreme) { 500 } elseif ($Turbo -and -not $Fast) { 400 } else { 250 }
+$EarlyTexturesMs = if ($Extreme) { 250 } elseif ($Turbo -and -not $Fast) { 200 } else { 50 }
 
 if ($Menu -and -not $PSBoundParameters.ContainsKey('DropMips')) {
     $DropMips = 1
@@ -140,6 +142,7 @@ $env:VICTORY_DRIVER_WATCH = "1"
 # DexNom's CPU submission workers. Ignored by the old binary, active after the port.
 $env:VICTORY_FILL_WORKERS = "4"
 $env:VICTORY_PARALLEL_PRELUDES = "1"
+if ($Fast) { $env:VICTORY_FILL_WORKERS = "6" }
 
 if ($Turbo) {
     # Switches from the fork's own play script and README that this launcher
@@ -155,12 +158,13 @@ if ($Turbo) {
     $env:VICTORY_ALIAS_ONCE = "1"
     $env:VICTORY_XMEM_PERSISTENT_VIEW = "1"
     $env:VICTORY_CLAMP_WAITS = "0"
-    # Stream textures harder, still bounded by the card budget.
-    if ($TextureStageMb -lt 320) { $TextureStageMb = 320 }
-    if ($TextureGateSeconds -lt 90) { $TextureGateSeconds = 90 }
+    # Stream textures harder, still bounded by the card budget. -Fast keeps
+    # the fork defaults instead: the aggressive values cost 42 ms a frame.
+    if (-not $Fast -and $TextureStageMb -lt 320) { $TextureStageMb = 320 }
+    if (-not $Fast -and $TextureGateSeconds -lt 90) { $TextureGateSeconds = 90 }
     # Up to 6 s of uploads before the title's decoration bake, instead of the
     # safe 1.5 s: textures picked by index are ready before gameplay starts.
-    $env:VICTORY_BAKE_TEXTURES_MS = "3000"
+    $env:VICTORY_BAKE_TEXTURES_MS = if ($Fast) { "1500" } else { "3000" }
 
     if ($Extreme) {
         # Normally the title's vertex/index/constant windows are read over
@@ -215,6 +219,6 @@ $env:VICTORY_CARD_REHASH_RUNS = "1"
 # Merge consecutive title buffer copies into one kernel call.
 $env:VICTORY_JOIN_COPIES = "1"
 
-$profile = if ($Extreme) { "EXTREME" } elseif ($Turbo) { "TURBO" } elseif ($Menu) { "MENU" } elseif ($Safe) { "SAFE" } else { "GAME" }
+$profile = if ($Extreme) { "EXTREME" } elseif ($Fast) { "FAST" } elseif ($Turbo) { "TURBO" } elseif ($Menu) { "MENU" } elseif ($Safe) { "SAFE" } else { "GAME" }
 Write-Host "Launching [$profile] at $DisplayMode, dropMips=$DropMips, textureStage=${TextureStageMb}MB, textureBudget=${TextureBudgetMb}MB"
 & $victory run $Exe --execute
