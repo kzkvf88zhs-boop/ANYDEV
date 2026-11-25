@@ -76,3 +76,12 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# anydev local build artefacts and diagnostics (never upload)
+/target-diag/
+*.log
+*.out.log
+*.transcript.txt
+/warm-fast.log
+/warm-fast.out
+
