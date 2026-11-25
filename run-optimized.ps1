@@ -48,7 +48,7 @@ if ($Extreme -or $Fast -or $Lean) { $Turbo = $true }
 # The fork otherwise reports a 3840x2160 TV to the title, which makes it
 # allocate 4x the render-target bytes and do 4x the pixel work. -Turbo uses
 # 720p because pixel work is the largest remaining cost on this card.
-$DisplayMode = if ($Extreme) { "960x540" } elseif ($Turbo) { "1280x720" } else { $Resolution }
+$DisplayMode = if ($PSBoundParameters.ContainsKey('Resolution')) { $Resolution } elseif ($Extreme) { "960x540" } elseif ($Turbo) { "1280x720" } else { $Resolution }
 $TextureStageMs = if ($Extreme) { 500 } elseif ($Turbo -and -not $Fast) { 400 } else { 250 }
 $EarlyTexturesMs = if ($Extreme) { 250 } elseif ($Turbo -and -not $Fast) { 200 } else { 50 }
 
