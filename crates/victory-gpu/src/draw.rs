@@ -24,6 +24,24 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// Takes `more` from the time a run may spend bringing in a long queue of
+/// textures at more than the usual pace; whether some is left. A gate keeps
+/// the fast pass from running for the whole cutscene and exhausting memory.
+/// `VICTORY_TEXTURE_GATE_S` sets it (0: none, 60 s by default).
+fn catching_up(more: std::time::Duration) -> bool {
+    static SPENT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_TEXTURE_GATE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(60);
+        seconds * 1000
+    });
+    let more = more.as_millis() as u64;
+    SPENT.fetch_add(more, Ordering::Relaxed) + more < total
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1786,12 +1804,22 @@ impl State {
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // A long queue (the world's first minutes: over 20,000 slots, which
+        // at the usual pace took minutes with black materials) gets 512 MB and
+        // 1.5 s a pass while the run's allowance for catching up lasts
+        // (`catching_up`, `VICTORY_TEXTURE_GATE_S`, 60 s of extra time).
+        // `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
+        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        const LONG: u64 = 2_000;
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let plain = span;
+        let (per_frame, span) = if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
+            (per_frame.max(PER_FRAME_CATCHING_UP), span.max(SPAN_CATCHING_UP))
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -1852,7 +1880,12 @@ impl State {
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                // Of the mips the view shows: what lies behind them is
+                // another texture's. Measuring the whole description made
+                // streamed textures overlap their neighbours, so views were
+                // marked stale and kept being re-uploaded forever.
+                let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc))
+                    .unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -2006,6 +2039,8 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        // Only the time beyond the plain pass spends the catch-up allowance.
+        catching_up(began.elapsed().saturating_sub(plain));
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

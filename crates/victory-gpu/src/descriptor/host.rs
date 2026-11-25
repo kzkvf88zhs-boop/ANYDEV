@@ -494,17 +494,55 @@ fn stale_rule() -> Rule {
 /// written. The range is kept for the next texture pass
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
 /// locks held: this locks one mutex of its own and calls nothing.
+/// Keep the producer cheap while adjacent pages or repeated writes arrive.
+/// A full queue falls back to checking all tracked views once, so completed
+/// uploads are still invalidated when a remap arrives during a long pause.
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+    } else if ranges.len() >= limit {
+        ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    } else {
+        ranges.push((start, end));
+    }
+    false
+}
+
+/// Before looking up descriptor spans, merge notifications from interleaved
+/// producers. The consumer cares only which addresses changed in this batch.
+fn merge_remaps(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
+        }
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+}
+
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them. A world's first minutes note
+    /// tens of thousands between two passes; dropping them left completed
+    /// uploads stale, so a full queue asks for a whole-heap rescan instead.
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    let gaps = keep_texture_change(&mut ranges, start, end);
-    if gaps != 0 {
-        STALE[2].fetch_add(gaps as u64, Relaxed);
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
     }
 }
 
@@ -1253,7 +1291,9 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         self.texture_slots_page_written(frame);
-        self.slots_remapped_under(&take_texture_changes(&REMAPPED), frame)
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        merge_remaps(&mut ranges);
+        self.slots_remapped_under(&ranges, frame)
     }
 
     fn slots_remapped_under(&self, ranges: &[(u64, u64)], frame: u64) -> usize {

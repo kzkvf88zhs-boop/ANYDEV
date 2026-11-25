@@ -1872,7 +1872,10 @@ enum Step {
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    Fill(Fill),
+    /// A run of independent upload fills, recorded together so they can be
+    /// done on CPU workers at submission (`VICTORY_FILL_WORKERS`).
+    Fills(Vec<Fill>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1888,6 +1891,87 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// Worker count for independent runs of upload fills at submission.
+/// `VICTORY_FILL_WORKERS` (1-6); the default keeps the serial path.
+fn fill_workers() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("VICTORY_FILL_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 6)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Fill {
+    dst: usize,
+    src: usize,
+    len: usize,
+}
+
+impl Fill {
+    fn run(self) {
+        copy_mapped(self.dst as *mut u8, self.src as *const u8, self.len, false);
+    }
+}
+
+impl Step {
+    fn fills(&self) -> &[Fill] {
+        match self {
+            Self::Fill(fill) => std::slice::from_ref(fill),
+            Self::Fills(group) => group,
+            _ => &[],
+        }
+    }
+}
+
+const FILLS_PER_JOB: usize = 128;
+
+/// Increasing scratch allocations have distinct destinations. A source that
+/// intersects the destination span (or an overflowing range) stays serial.
+fn independent_fills(fills: &[Fill]) -> bool {
+    let Some(first) = fills.first() else {
+        return false;
+    };
+    let mut end = first.dst;
+    for fill in fills {
+        let Some(next) = fill.dst.checked_add(fill.len) else {
+            return false;
+        };
+        if fill.dst < end {
+            return false;
+        }
+        end = next;
+    }
+    fills.iter().all(|f| {
+        f.src
+            .checked_add(f.len)
+            .is_some_and(|src_end| f.src >= end || src_end <= first.dst)
+    })
+}
+
+/// Run a contiguous series of fills. The pool joins before the next step
+/// can access title memory, release scratch, or send the list to the card.
+fn run_fills(fills: &[Fill], workers: usize) -> usize {
+    let jobs = workers.min(fills.len() / FILLS_PER_JOB);
+    if jobs > 1 && independent_fills(fills) {
+        let queued = fills
+            .chunks(fills.len().div_ceil(jobs))
+            .map(|chunk| {
+                let owned = chunk.to_vec();
+                Box::new(move || owned.into_iter().for_each(Fill::run)) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(queued);
+        jobs
+    } else {
+        fills.iter().copied().for_each(Fill::run);
+        1
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1895,6 +1979,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// First of the contiguous fills at the end of `copies`.
+    fill_start: usize,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -1926,6 +2012,32 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// Short runs keep the original inline steps, without allocating a group.
+    /// Any intervening non-fill ends the run (including Copy and GpuWrite).
+    fn append_fill(&mut self, fill: Fill, workers: usize) {
+        if workers > 1 {
+            match self.copies.last_mut() {
+                Some(Step::Fills(group)) if group.len() < 4096 => {
+                    group.push(fill);
+                    return;
+                }
+                Some(Step::Fill(_)) => {}
+                _ => self.fill_start = self.copies.len(),
+            }
+            if self.copies.len() - self.fill_start + 1 == 2 * FILLS_PER_JOB {
+                let mut group = Vec::with_capacity(2 * FILLS_PER_JOB);
+                for step in self.copies.drain(self.fill_start..) {
+                    let Step::Fill(f) = step else { unreachable!() };
+                    group.push(f);
+                }
+                group.push(fill);
+                self.copies.push(Step::Fills(group));
+                return;
+            }
+        }
+        self.copies.push(Step::Fill(fill));
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2573,22 +2685,25 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
-                        // Not waited for, and checked when the flights land
-                        // (`fill_ahead`).
-                        if fill_ahead::on(src, len) {
-                            if count {
-                                fill_ahead::read(src, len);
+                Step::Fill(_) | Step::Fills(_) => {
+                    for fill in step.fills() {
+                        let (src, len) = (fill.src, fill.len);
+                        if touches(written, src, src + len) {
+                            // Not waited for, and checked when the flights land
+                            // (`fill_ahead`).
+                            if fill_ahead::on(src, len) {
+                                if count {
+                                    fill_ahead::read(src, len);
+                                }
+                                continue;
                             }
-                            continue;
+                            if count {
+                                LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                                #[cfg(feature = "diagnostics")]
+                                fill_check::blocked(written, src, len);
+                            }
+                            return Some(WHY_READ);
                         }
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            fill_check::blocked(written, src, len);
-                        }
-                        return Some(WHY_READ);
                     }
                 }
                 Step::Texture(staging) => {
@@ -6549,9 +6664,8 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let fill = Fill { dst: dst as usize, src: src as usize, len };
+        self.deferred().append_fill(fill, fill_workers());
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -6892,15 +7006,19 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                Step::Fill(fill) | Step::Fills(..) => {
+                    let fills = step.fills();
+                    let bytes = fills.iter().map(|f| f.len).sum::<usize>();
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                        fill_check::runs(src, len);
+                        add(C::Copies, fills.len() as u64);
+                        add(C::CopyBytes, bytes as u64);
+                        for fill in fills {
+                            fill_check::runs(fill.src, fill.len);
+                        }
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    let _ = run_fills(fills, fill_workers());
+                    bytes
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
