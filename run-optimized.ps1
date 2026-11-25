@@ -39,11 +39,13 @@ param(
     [switch]$Fast,
     # A/B: max fill workers and skip the post-upload texture recheck.
     [switch]$Lean,
+    # No-visual-loss VRAM cuts: on-demand mips + smaller caches.
+    [switch]$Compact,
     # Alternate binary (e.g. the diagnostics build that honours the loop limit).
     [string]$VictoryBinary = ""
 )
 
-if ($Extreme -or $Fast -or $Lean) { $Turbo = $true }
+if ($Extreme -or $Fast -or $Lean -or $Compact) { $Turbo = $true }
 
 # The fork otherwise reports a 3840x2160 TV to the title, which makes it
 # allocate 4x the render-target bytes and do 4x the pixel work. -Turbo uses
@@ -144,8 +146,8 @@ $env:VICTORY_DRIVER_WATCH = "1"
 # DexNom's CPU submission workers. Ignored by the old binary, active after the port.
 $env:VICTORY_FILL_WORKERS = "4"
 $env:VICTORY_PARALLEL_PRELUDES = "1"
-if ($Fast -or $Lean) { $env:VICTORY_FILL_WORKERS = "6" }
-if ($Lean) { $env:VICTORY_HEAP_RECHECK = "0" }
+if ($Fast -or $Lean -or $Compact) { $env:VICTORY_FILL_WORKERS = "6" }
+if ($Lean -or $Compact) { $env:VICTORY_HEAP_RECHECK = "0" }
 
 if ($Turbo) {
     # Switches from the fork's own play script and README that this launcher
@@ -222,6 +224,18 @@ $env:VICTORY_CARD_REHASH_RUNS = "1"
 # Merge consecutive title buffer copies into one kernel call.
 $env:VICTORY_JOIN_COPIES = "1"
 
-$profile = if ($Extreme) { "EXTREME" } elseif ($Lean) { "LEAN" } elseif ($Fast) { "FAST" } elseif ($Turbo) { "TURBO" } elseif ($Menu) { "MENU" } elseif ($Safe) { "SAFE" } else { "GAME" }
+if ($Compact) {
+    # Allocate only mip levels the title actually holds, and shrink caches.
+    # Resolution and mip count stay unchanged, so there is no visual loss.
+    $env:VICTORY_LEVELS_ON_DEMAND = "1"
+    $env:VICTORY_TEXTURE_BUDGET_MB = "3072"
+    $env:VICTORY_TEXTURE_STAGE_MB = "192"
+    $env:VICTORY_TEXTURE_STAGE_MS = "250"
+    $env:VICTORY_TEXTURE_GATE_S = "60"
+    $env:VICTORY_BAKE_TEXTURES_MS = "1500"
+    $env:VICTORY_CARD_BUFFERS_MB = "512"
+}
+
+$profile = if ($Extreme) { "EXTREME" } elseif ($Compact) { "COMPACT" } elseif ($Lean) { "LEAN" } elseif ($Fast) { "FAST" } elseif ($Turbo) { "TURBO" } elseif ($Menu) { "MENU" } elseif ($Safe) { "SAFE" } else { "GAME" }
 Write-Host "Launching [$profile] at $DisplayMode, dropMips=$DropMips, textureStage=${TextureStageMb}MB, textureBudget=${TextureBudgetMb}MB"
 & $victory run $Exe --execute
