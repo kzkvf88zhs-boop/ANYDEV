@@ -7006,7 +7006,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                Step::Fill(fill) | Step::Fills(..) => {
+                Step::Fill(_) | Step::Fills(..) => {
                     let fills = step.fills();
                     let bytes = fills.iter().map(|f| f.len).sum::<usize>();
                     #[cfg(feature = "diagnostics")]
